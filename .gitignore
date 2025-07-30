@@ -1,0 +1,11 @@
+# Environment variables
+.env
+
+# Virtual environment
+venv/
+__pycache__/
+*.pyc
+
+# Data files
+data/odds.json
+model_predictions.txt 
