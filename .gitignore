@@ -7,5 +7,6 @@ __pycache__/
 *.pyc
 
 # Data files
-data/odds.json
-model_predictions.txt 
+data/
+model_predictions.txt
+xgboost_results.txt 

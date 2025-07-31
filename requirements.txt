@@ -1,4 +1,6 @@
 numpy
 scikit-learn
 requests
-python-dotenv 
+python-dotenv
+xgboost
+scikit-optimize 
