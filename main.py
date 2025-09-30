@@ -1,16 +1,49 @@
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
 import csv
 from collections import defaultdict
 import numpy as np
 from sklearn.model_selection import train_test_split, GridSearchCV
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score
 import xgboost as xgb
 import requests
 import json
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
-import os
-from dotenv import load_dotenv
+
+def get_advanced_stats(api_key, season, stat_type="batting"):
+    """Fetches advanced stats for a given season from SportsBlaze."""
+    url = f"https://api.sportsblaze.com/mlb/v1/stats/advanced/{season}/{stat_type}.json?key={api_key}"
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        stats = response.json()
+        player_stats = {player['name']: player['stats'] for player in stats.get('players', [])}
+        return player_stats
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching advanced stats: {e}")
+        return {}
+    except json.JSONDecodeError:
+        print(f"Error decoding JSON from advanced stats response: {response.text}")
+        return {}
+
+def get_daily_schedule(api_key, game_date):
+    """Fetches the daily schedule from the SportsBlaze API."""
+    url = f"https://api.sportsblaze.com/mlb/v1/schedule/daily/{game_date.strftime('%Y-%m-%d')}.json?key={api_key}"
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching daily schedule: {e}")
+        return None
+    except json.JSONDecodeError:
+        print(f"Error decoding JSON from daily schedule response: {response.text}")
+        return None
 
 TEAM_NAME_MAP = {
     "Arizona Diamondbacks": "ARI",
@@ -114,70 +147,32 @@ def read_gamelog_to_dict(file_path):
             games.append(game_dict)
     return games
 
-def create_features(games, rolling_window=10):
+def create_features(games, rolling_window=100):
     team_stats = defaultdict(lambda: defaultdict(list))
     pitcher_stats = defaultdict(lambda: defaultdict(list))
     featured_games = []
-    
-    # First pass to build up historical data
+
+    # Sort games by date to process them in chronological order
+    games.sort(key=lambda x: x['date'])
+
     for game in games:
         home_team = game['home_team']
         visitor_team = game['visitor_team']
         home_pitcher = game['home_starting_pitcher_name']
         visitor_pitcher = game['visitor_starting_pitcher_name']
 
-        # Calculate OPS for both teams
-        for team in ['home', 'visitor']:
-            hits = int(game[f'{team}_hits'])
-            walks = int(game[f'{team}_walks'])
-            hbp = int(game[f'{team}_hbp'])
-            at_bats = int(game[f'{team}_at_bats'])
-            sac_flies = int(game[f'{team}_sacrifice_flies'])
-            
-            doubles = int(game[f'{team}_doubles'])
-            triples = int(game[f'{team}_triples'])
-            homeruns = int(game[f'{team}_homeruns'])
-            singles = hits - (doubles + triples + homeruns)
-            
-            # Calculate OBP (On-Base Percentage)
-            obp_numerator = hits + walks + hbp
-            obp_denominator = at_bats + walks + hbp + sac_flies
-            obp = obp_numerator / obp_denominator if obp_denominator > 0 else 0
-            
-            # Calculate SLG (Slugging Percentage)
-            slg_numerator = singles + (2 * doubles) + (3 * triples) + (4 * homeruns)
-            slg_denominator = at_bats
-            slg = slg_numerator / slg_denominator if slg_denominator > 0 else 0
-            
-            ops = obp + slg
-            team_stats[game[f'{team}_team']]['ops'].append(ops)
-
-        # Update team errors
-        team_stats[home_team]['errors'].append(int(game['home_errors']))
-        team_stats[visitor_team]['errors'].append(int(game['visitor_errors']))
+        #
+        # Create features using data *before* the current game
+        #
+        home_median_ops = np.median(team_stats[home_team]['ops'][-rolling_window:]) if team_stats[home_team]['ops'] else np.nan
+        home_median_errors = np.median(team_stats[home_team]['errors'][-rolling_window:]) if team_stats[home_team]['errors'] else np.nan
+        visitor_median_ops = np.median(team_stats[visitor_team]['ops'][-rolling_window:]) if team_stats[visitor_team]['ops'] else np.nan
+        visitor_median_errors = np.median(team_stats[visitor_team]['errors'][-rolling_window:]) if team_stats[visitor_team]['errors'] else np.nan
         
-        # Update pitcher stats with Team Earned Runs
-        pitcher_stats[home_pitcher]['era'].append(int(game['visitor_team_earned_runs']))
-        pitcher_stats[visitor_pitcher]['era'].append(int(game['home_team_earned_runs']))
-    
-    # Second pass to create features
-    for game in games:
-        home_team = game['home_team']
-        visitor_team = game['visitor_team']
-        home_pitcher = game['home_starting_pitcher_name']
-        visitor_pitcher = game['visitor_starting_pitcher_name']
-        
-        # Calculate rolling medians for home team
-        home_median_ops = np.median(team_stats[home_team]['ops'][-rolling_window:])
-        home_median_errors = np.median(team_stats[home_team]['errors'][-rolling_window:])
-
-        # Calculate rolling medians for visitor team
-        visitor_median_ops = np.median(team_stats[visitor_team]['ops'][-rolling_window:])
-        visitor_median_errors = np.median(team_stats[visitor_team]['errors'][-rolling_window:])
-        
-        # Calculate rolling median ERA for pitchers
-        home_pitcher_era = np.median(pitcher_stats[home_pitcher]['era'][-rolling_window:]) if len(pitcher_stats[home_pitcher]['era']) >= rolling_window else np.nan
-        visitor_pitcher_era = np.median(pitcher_stats[visitor_pitcher]['era'][-rolling_window:]) if len(pitcher_stats[visitor_pitcher]['era']) >= rolling_window else np.nan
+        home_pitcher_era = np.median(pitcher_stats[home_pitcher]['era'][-rolling_window:]) if pitcher_stats[home_pitcher]['era'] else np.nan
+        visitor_pitcher_era = np.median(pitcher_stats[visitor_pitcher]['era'][-rolling_window:]) if pitcher_stats[visitor_pitcher]['era'] else np.nan
+        home_team_era = np.median(team_stats[home_team]['team_era'][-rolling_window:]) if team_stats[home_team]['team_era'] else np.nan
+        visitor_team_era = np.median(team_stats[visitor_team]['team_era'][-rolling_window:]) if team_stats[visitor_team]['team_era'] else np.nan
 
         featured_game = {
             'date': game['date'],
@@ -193,147 +188,95 @@ def create_features(games, rolling_window=10):
             'visitor_median_errors': visitor_median_errors,
             'home_pitcher_era': home_pitcher_era,
             'visitor_pitcher_era': visitor_pitcher_era,
+            'home_team_era': home_team_era,
+            'visitor_team_era': visitor_team_era,
         }
         featured_games.append(featured_game)
+        
+        # Now, update the stats with the outcome of the *current* game for future calculations
+        #
+        for team_type in ['home', 'visitor']:
+            team_abbr = game[f'{team_type}_team']
+            
+            # Calculate OPS
+            hits = int(game[f'{team_type}_hits'])
+            walks = int(game[f'{team_type}_walks'])
+            hbp = int(game[f'{team_type}_hbp'])
+            at_bats = int(game[f'{team_type}_at_bats'])
+            sac_flies = int(game[f'{team_type}_sacrifice_flies'])
+            doubles = int(game[f'{team_type}_doubles'])
+            triples = int(game[f'{team_type}_triples'])
+            homeruns = int(game[f'{team_type}_homeruns'])
+            singles = hits - (doubles + triples + homeruns)
+            
+            obp_numerator = hits + walks + hbp
+            obp_denominator = at_bats + walks + hbp + sac_flies
+            obp = obp_numerator / obp_denominator if obp_denominator > 0 else 0
+            
+            slg_numerator = singles + (2 * doubles) + (3 * triples) + (4 * homeruns)
+            slg_denominator = at_bats
+            slg = slg_numerator / slg_denominator if slg_denominator > 0 else 0
+            
+            ops = obp + slg
+            team_stats[team_abbr]['ops'].append(ops)
 
-    return featured_games
+            # Store errors
+            team_stats[team_abbr]['errors'].append(int(game[f'{team_type}_errors']))
+            
+            # Store team earned runs for team-based ERA proxy
+            team_stats[team_abbr]['team_era'].append(int(game[f'{team_type}_team_earned_runs']))
+            
+            # Store runs allowed for team-based ERA proxy
+            opponent_type = 'visitor' if team_type == 'home' else 'home'
+            runs_allowed = int(game[f'{opponent_type}_score'])
+            team_stats[team_abbr]['era_proxy'].append(runs_allowed)
+
+        # Update pitcher-specific stats
+        pitcher_stats[home_pitcher]['era'].append(int(game['visitor_team_earned_runs']))
+        pitcher_stats[visitor_pitcher]['era'].append(int(game['home_team_earned_runs']))
+
+    return featured_games, team_stats, pitcher_stats
 
 
-def train_logistic_regression_model(featured_games):
-    X = []
-    y = []
 
-    for game in featured_games:
-        # Check for NaN values and skip the game if any are present
-        if any(np.isnan(val) for val in [
-            game['home_median_ops'], game['home_median_errors'],
-            game['visitor_median_ops'], game['visitor_median_errors'],
-            game['home_pitcher_era'], game['visitor_pitcher_era']
-        ]):
-            continue
 
-        features = [
-            game['home_median_ops'],
-            game['home_median_errors'],
-            game['visitor_median_ops'],
-            game['visitor_median_errors'],
-            game['home_pitcher_era'],
-            game['visitor_pitcher_era'],
-        ]
-        X.append(features)
-        y.append(1 if game['home_score'] > game['visitor_score'] else 0)
 
-    if not X or not y:
-        print("Not enough data to train the Logistic Regression model.")
+
+def train_and_evaluate_model(featured_games, test_year=2024):
+    print(f"\n--- Training on pre-{test_year} data, testing on {test_year} season ---")
+
+    # Split data into training and testing based on the test_year
+    train_games = [game for game in featured_games if not game['date'].startswith(str(test_year))]
+    test_games = [game for game in featured_games if game['date'].startswith(str(test_year))]
+
+    if not test_games:
+        print(f"No {test_year} data found to test on.")
         return None
-
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
-    model = LogisticRegression()
-    model.fit(X_train, y_train)
-
-    y_pred = model.predict(X_test)
-    accuracy = accuracy_score(y_test, y_pred)
-    print(f"Logistic Regression Model accuracy: {accuracy}")
-
-    return model
-
-def train_xgboost_model(featured_games):
-    X = []
-    y = []
-
-    for game in featured_games:
-        # Check for NaN values and skip the game if any are present
-        if any(np.isnan(val) for val in [
-            game['home_median_ops'], game['home_median_errors'],
-            game['visitor_median_ops'], game['visitor_median_errors'],
-            game['home_pitcher_era'], game['visitor_pitcher_era']
-        ]):
-            continue
-
-        features = [
-            game['home_median_ops'],
-            game['home_median_errors'],
-            game['visitor_median_ops'],
-            game['visitor_median_errors'],
-            game['home_pitcher_era'],
-            game['visitor_pitcher_era'],
-        ]
-        X.append(features)
-        y.append(1 if game['home_score'] > game['visitor_score'] else 0)
-
-    if not X or not y:
-        print("Not enough data to train the XGBoost model.")
-        return None
-
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
-    # Define the parameter grid for GridSearchCV - this is the one that yielded 55.28%
-    param_grid = {
-        'n_estimators': [100, 200],
-        'max_depth': [3, 4],
-        'learning_rate': [0.1, 0.05],
-        'subsample': [0.7, 0.8],
-        'colsample_bytree': [0.7, 0.8]
-    }
-
-    # Instantiate the XGBoost classifier
-    xgb_model = xgb.XGBClassifier(eval_metric='logloss', random_state=42)
-
-    # Instantiate GridSearchCV
-    grid_search = GridSearchCV(estimator=xgb_model, param_grid=param_grid, 
-                               scoring='accuracy', n_jobs=-1, cv=3, verbose=1)
-
-    # Fit GridSearchCV
-    print("Starting hyperparameter tuning with the championship configuration...")
-    grid_search.fit(X_train, y_train)
-
-    # Get the best model
-    best_xgb_model = grid_search.best_estimator_
-    
-    print(f"Best XGBoost parameters found: {grid_search.best_params_}")
-
-    # Evaluate the best model on the test set
-    y_pred = best_xgb_model.predict(X_test)
-    accuracy = accuracy_score(y_test, y_pred)
-    print(f"Fine-tuned XGBoost Model accuracy: {accuracy}")
-
-    return best_xgb_model
-
-
-def test_model_on_2023_season(featured_games):
-    print("\n--- Testing Model Performance on 2023 Season ---")
-
-    # Split data into training (pre-2023) and testing (2023)
-    train_games = [game for game in featured_games if not game['date'].startswith('2023')]
-    test_games_2023 = [game for game in featured_games if game['date'].startswith('2023')]
-
-    if not test_games_2023:
-        print("No 2023 data found to test on.")
-        return
 
     # Prepare training data
-    X_train = []
-    y_train = []
+    X_train, y_train = [], []
     for game in train_games:
         if any(np.isnan(val) for val in [
             game['home_median_ops'], game['home_median_errors'],
             game['visitor_median_ops'], game['visitor_median_errors'],
-            game['home_pitcher_era'], game['visitor_pitcher_era']
+            game['home_pitcher_era'], game['visitor_pitcher_era'],
+            game['home_team_era'], game['visitor_team_era']
         ]):
             continue
         features = [
-            game['home_median_ops'],
-            game['home_median_errors'],
-            game['visitor_median_ops'],
-            game['visitor_median_errors'],
-            game['home_pitcher_era'],
-            game['visitor_pitcher_era'],
+            game['home_median_ops'], game['home_median_errors'],
+            game['visitor_median_ops'], game['visitor_median_errors'],
+            game['home_pitcher_era'], game['visitor_pitcher_era'],
+            game['home_team_era'], game['visitor_team_era'],
         ]
         X_train.append(features)
         y_train.append(1 if game['home_score'] > game['visitor_score'] else 0)
 
-    # Train the XGBoost model with the championship config
+    if not X_train:
+        print("Not enough training data available.")
+        return None
+
+    # Train the XGBoost model with hyperparameter tuning
     param_grid = {
         'n_estimators': [100, 200],
         'max_depth': [3, 4],
@@ -343,36 +286,35 @@ def test_model_on_2023_season(featured_games):
     }
     xgb_model = xgb.XGBClassifier(eval_metric='logloss', random_state=42)
     grid_search = GridSearchCV(estimator=xgb_model, param_grid=param_grid, 
-                               scoring='accuracy', n_jobs=-1, cv=3, verbose=0) # verbose=0 to keep log clean
+                               scoring='accuracy', n_jobs=-1, cv=3, verbose=1)
+    
+    print("Starting hyperparameter tuning...")
     grid_search.fit(X_train, y_train)
     best_model = grid_search.best_estimator_
-    print("Model trained on pre-2023 data.")
+    print(f"Best XGBoost parameters found: {grid_search.best_params_}")
+    print(f"Model trained on {len(X_train)} pre-{test_year} games.")
 
-    # Prepare test data and make predictions for the 2023 season
-    correct_predictions = 0
-    total_predictions = 0
+    # Prepare test data and make predictions for the test season
+    correct_predictions, total_predictions = 0, 0
     confidence_buckets = {
-        "50-55%": {"correct": 0, "total": 0},
-        "55-60%": {"correct": 0, "total": 0},
-        "60-65%": {"correct": 0, "total": 0},
-        "65%+":   {"correct": 0, "total": 0},
+        "50-55%": {"correct": 0, "total": 0}, "55-60%": {"correct": 0, "total": 0},
+        "60-65%": {"correct": 0, "total": 0}, "65%+":   {"correct": 0, "total": 0},
     }
 
-    for game in test_games_2023:
+    for game in test_games:
         if any(np.isnan(val) for val in [
             game['home_median_ops'], game['home_median_errors'],
             game['visitor_median_ops'], game['visitor_median_errors'],
-            game['home_pitcher_era'], game['visitor_pitcher_era']
+            game['home_pitcher_era'], game['visitor_pitcher_era'],
+            game['home_team_era'], game['visitor_team_era']
         ]):
             continue
         
         features = [
-            game['home_median_ops'],
-            game['home_median_errors'],
-            game['visitor_median_ops'],
-            game['visitor_median_errors'],
-            game['home_pitcher_era'],
-            game['visitor_pitcher_era'],
+            game['home_median_ops'], game['home_median_errors'],
+            game['visitor_median_ops'], game['visitor_median_errors'],
+            game['home_pitcher_era'], game['visitor_pitcher_era'],
+            game['home_team_era'], game['visitor_team_era'],
         ]
         actual_winner = 1 if game['home_score'] > game['visitor_score'] else 0
         
@@ -384,23 +326,17 @@ def test_model_on_2023_season(featured_games):
             correct_predictions += 1
         total_predictions += 1
 
-        # Sort into confidence buckets
-        if 0.50 <= confidence < 0.55:
-            bucket = "50-55%"
-        elif 0.55 <= confidence < 0.60:
-            bucket = "55-60%"
-        elif 0.60 <= confidence < 0.65:
-            bucket = "60-65%"
-        else:
-            bucket = "65%+"
+        if 0.50 <= confidence < 0.55: bucket = "50-55%"
+        elif 0.55 <= confidence < 0.60: bucket = "55-60%"
+        elif 0.60 <= confidence < 0.65: bucket = "60-65%"
+        else: bucket = "65%+"
         
         confidence_buckets[bucket]['total'] += 1
         if predicted_winner == actual_winner:
             confidence_buckets[bucket]['correct'] += 1
 
-    # Print the final report
     if total_predictions > 0:
-        print(f"\nOverall Accuracy on 2023 Season: {correct_predictions / total_predictions:.2%} on {total_predictions} games.")
+        print(f"\nOverall Accuracy on {test_year} Season: {correct_predictions / total_predictions:.2%} on {total_predictions} games.")
         print("\nAccuracy by Prediction Confidence:")
         for bucket, data in confidence_buckets.items():
             if data['total'] > 0:
@@ -409,8 +345,10 @@ def test_model_on_2023_season(featured_games):
             else:
                 print(f"  {bucket}: No games in this confidence range.")
     else:
-        print("Could not make any predictions for the 2023 season.")
+        print(f"Could not make any predictions for the {test_year} season.")
     print("-------------------------------------------------")
+    
+    return best_model
 
 
 def get_live_odds(api_key):
@@ -442,212 +380,129 @@ def prob_to_american(prob):
     decimal_odds = 1 / prob
     return decimal_to_american(decimal_odds)
 
-def find_value_bets(model, live_odds, featured_games, output_filename):
-    if not featured_games:
-        print("No featured games to make predictions on.")
-        return
-    if not live_odds:
-        print("No live odds data to process.")
-        return
-
-    value_bets = []
-    todays_games_summary = []
-    tomorrows_games_summary = []
+def find_value_bets(model, api_key, team_stats, pitcher_stats, output_filename, rolling_window=100):
     now = datetime.now(timezone.utc)
     est = ZoneInfo("America/New_York")
     now_est = now.astimezone(est)
     today_date = now_est.date()
-    tomorrow_date = today_date + timedelta(days=1)
+    current_season = today_date.year
+
+    # Fetch today's and tomorrow's schedules
+    todays_schedule = get_daily_schedule(api_key, today_date)
+    tomorrows_schedule = get_daily_schedule(api_key, today_date + timedelta(days=1))
     
-    # Create a lookup map for the last game played between two teams for efficiency
-    featured_games_map = {}
-    for game in featured_games:
-        featured_games_map[(game['home_team'], game['visitor_team'])] = game
+    live_games = []
+    if todays_schedule and 'games' in todays_schedule:
+        live_games.extend(todays_schedule['games'])
+    if tomorrows_schedule and 'games' in tomorrows_schedule:
+        live_games.extend(tomorrows_schedule['games'])
 
-    for game_odds in live_odds:
-        commence_time = datetime.fromisoformat(game_odds['commence_time'].replace('Z', '+00:00'))
+    if not live_games:
+        print("No live games found for today or tomorrow.")
+        return
+
+    games_summary = []
+
+    for game in live_games:
+        commence_time = datetime.fromisoformat(game['date'].replace('Z', '+00:00'))
         commence_time_est = commence_time.astimezone(est)
-        game_date_est = commence_time_est.date()
 
-        if game_date_est < today_date:
-            continue
-
-        home_team_full = game_odds['home_team']
-        away_team_full = game_odds['away_team']
+        home_team_full = game['teams']['home']['name']
+        away_team_full = game['teams']['away']['name']
         
         home_team_abbr = TEAM_NAME_MAP.get(home_team_full)
         away_team_abbr = TEAM_NAME_MAP.get(away_team_full)
 
-        home_team_odds = "N/A"
-        away_team_odds = "N/A"
+        home_team_odds, away_team_odds = "N/A", "N/A"
 
-        # Try to make a prediction and find value bets
         if home_team_abbr and away_team_abbr:
-            key = (home_team_abbr, away_team_abbr)
-            if key in featured_games_map:
-                latest_features = featured_games_map[key]
-                
-                latest_game_features = np.array([
-                    latest_features['home_median_ops'],
-                    latest_features['home_median_errors'],
-                    latest_features['visitor_median_ops'],
-                    latest_features['visitor_median_errors'],
-                    latest_features['home_pitcher_era'],
-                    latest_features['visitor_pitcher_era'],
-                ]).reshape(1, -1)
-                
-                if not np.isnan(latest_game_features).any():
-                    # Get win probabilities for both teams
-                    model_probs = model.predict_proba(latest_game_features)[0]
-                    home_win_prob = model_probs[1]
-                    away_win_prob = model_probs[0]
+            home_pitcher = game.get('starters', {}).get('home', {}).get('name') or "Unknown"
+            away_pitcher = game.get('starters', {}).get('away', {}).get('name') or "Unknown"
 
-                    home_team_odds = prob_to_american(home_win_prob)
-                    away_team_odds = prob_to_american(away_win_prob)
+            # The daily schedule endpoint doesn't seem to include lineups based on docs.
+            # We will use historical median OPS as the primary offensive feature.
+            home_ops = np.median(team_stats[home_team_abbr]['ops'][-rolling_window:])
+            visitor_ops = np.median(team_stats[away_team_abbr]['ops'][-rolling_window:])
+            
+            home_median_errors = np.median(team_stats[home_team_abbr]['errors'][-rolling_window:])
+            visitor_median_errors = np.median(team_stats[away_team_abbr]['errors'][-rolling_window:])
+            
+            home_pitcher_era = np.median(pitcher_stats[home_pitcher]['era'][-rolling_window:]) if home_pitcher != "Unknown" and pitcher_stats[home_pitcher]['era'] else np.median(team_stats[home_team_abbr]['team_era'][-rolling_window:])
+            visitor_pitcher_era = np.median(pitcher_stats[away_pitcher]['era'][-rolling_window:]) if away_pitcher != "Unknown" and pitcher_stats[away_pitcher]['era'] else np.median(team_stats[away_team_abbr]['team_era'][-rolling_window:])
+            
+            home_team_era = np.median(team_stats[home_team_abbr]['team_era'][-rolling_window:])
+            visitor_team_era = np.median(team_stats[away_team_abbr]['team_era'][-rolling_window:])
+            
+            features = np.array([
+                home_ops, home_median_errors,
+                visitor_ops, visitor_median_errors,
+                home_pitcher_era, visitor_pitcher_era,
+                home_team_era, visitor_team_era,
+            ]).reshape(1, -1)
 
-                    # Determine our predicted winner
-                    if home_win_prob > away_win_prob:
-                        predicted_winner = home_team_full
-                        predicted_winner_prob = home_win_prob
-                    else:
-                        predicted_winner = away_team_full
-                        predicted_winner_prob = away_win_prob
+            if not np.isnan(features).any():
+                model_probs = model.predict_proba(features)[0]
+                home_win_prob, away_win_prob = model_probs[1], model_probs[0]
+                home_team_odds = prob_to_american(home_win_prob)
+                away_team_odds = prob_to_american(away_win_prob)
+            
+            games_summary.append({
+                "home_team": home_team_full, "away_team": away_team_full,
+                "game_time": commence_time_est.strftime('%H:%M'),
+                "home_team_odds": home_team_odds, "away_team_odds": away_team_odds,
+                "home_pitcher": home_pitcher, "away_pitcher": away_pitcher,
+                "date": commence_time_est.date()
+            })
 
-                    # Check for value bets on either team
-                    for bookmaker in game_odds['bookmakers']:
-                        for market in bookmaker['markets']:
-                            if market['key'] == 'h2h':
-                                for outcome in market['outcomes']:
-                                    bet_on_team = outcome['name']
-                                    sportsbook_odds = outcome['price']
-                                    sportsbook_prob = decimal_to_prob(sportsbook_odds)
-                                    american_odds = decimal_to_american(sportsbook_odds)
-                                    
-                                    our_prob_for_team = home_win_prob if bet_on_team == home_team_full else away_win_prob
-                                    our_model_american_odds = prob_to_american(our_prob_for_team)
-                                    
-                                    edge = our_prob_for_team - sportsbook_prob
-
-                                    if edge > 0:
-                                        value_bets.append({
-                                            "home_team": home_team_full,
-                                            "away_team": away_team_full,
-                                            "predicted_winner": predicted_winner,
-                                            "predicted_winner_prob": predicted_winner_prob,
-                                            "bet_on_team": bet_on_team,
-                                            "our_prob_for_bet": our_prob_for_team,
-                                            "sportsbook_prob": sportsbook_prob,
-                                            "edge": edge,
-                                            "bookmaker": bookmaker['title'],
-                                            "price": sportsbook_odds,
-                                            "american_odds": american_odds,
-                                            "our_model_american_odds": our_model_american_odds,
-                                            "game_date": commence_time_est.strftime('%Y-%m-%d %H:%M')
-                                        })
-                else:
-                    print(f"Skipping prediction for {away_team_full} @ {home_team_full}: NaN value in features.")
-        
-        # Add to daily summary with our model's odds (or N/A if prediction failed)
-        game_summary = {
-            "home_team": home_team_full,
-            "away_team": away_team_full,
-            "game_time": commence_time_est.strftime('%H:%M'),
-            "home_team_odds": home_team_odds,
-            "away_team_odds": away_team_odds
-        }
-
-        if game_date_est == today_date:
-            todays_games_summary.append(game_summary)
-        elif game_date_est == tomorrow_date:
-            tomorrows_games_summary.append(game_summary)
-    
-    # Sort bets by edge
-    value_bets.sort(key=lambda x: x['edge'], reverse=True)
-
-    # Save to file
     with open(output_filename, 'w') as f:
         report_time_est = datetime.now(est).strftime('%Y-%m-%d %H:%M:%S')
         f.write(f"Report generated on: {report_time_est} EST\n\n")
 
-        # Today's Summary Section
         f.write("Today's Games and Our Model's Odds\n\n")
-        if todays_games_summary:
-            todays_games_summary.sort(key=lambda x: x['game_time'])
-            for game in todays_games_summary:
+        today_games = [g for g in games_summary if g['date'] == today_date]
+        if today_games:
+            for game in sorted(today_games, key=lambda x: x['game_time']):
                 f.write(f"{game['game_time']} EST - {game['home_team']} ({game['home_team_odds']}) vs. {game['away_team']} ({game['away_team_odds']})\n")
+                f.write(f"  Pitchers: {game['home_pitcher']} vs {game['away_pitcher']}\n\n")
         else:
             f.write("No games scheduled for today.\n")
+        
         f.write("\n----------------------------------------\n\n")
 
-        # Tomorrow's Summary Section
         f.write("Tomorrow's Games and Our Model's Odds\n\n")
-        if tomorrows_games_summary:
-            tomorrows_games_summary.sort(key=lambda x: x['game_time'])
-            for game in tomorrows_games_summary:
+        tomorrow_games = [g for g in games_summary if g['date'] != today_date]
+        if tomorrow_games:
+            for game in sorted(tomorrow_games, key=lambda x: x['game_time']):
                 f.write(f"{game['game_time']} EST - {game['home_team']} ({game['home_team_odds']}) vs. {game['away_team']} ({game['away_team_odds']})\n")
+                f.write(f"  Pitchers: {game['home_pitcher']} vs {game['away_pitcher']}\n\n")
         else:
             f.write("No games scheduled for tomorrow.\n")
-        f.write("\n----------------------------------------\n\n")
 
-        f.write("Model Predictions and Statistical Edges\n\n")
-        for bet in value_bets:
-            f.write(f"Match: {bet['home_team']} vs {bet['away_team']}\n")
-            f.write(f"  Date: {bet['game_date']} EST\n")
-            f.write(f"  Our Predicted Winner: {bet['predicted_winner']} ({bet['predicted_winner_prob']:.2%})\n")
-            f.write(f"  ----------------------------------------\n")
-            f.write(f"  VALUE BET on: {bet['bet_on_team']}\n")
-            f.write(f"  Bookmaker: {bet['bookmaker']}\n")
-            f.write(f"  Bookmaker Odds: {bet['price']} ({bet['american_odds']})\n")
-            f.write(f"  Our Odds: ({bet['our_model_american_odds']})\n")
-            f.write(f"  Our Probability: {bet['our_prob_for_bet']:.2%}\n")
-            f.write(f"  Bookmaker's Implied Probability: {bet['sportsbook_prob']:.2%}\n")
-            f.write(f"  Edge: +{bet['edge']:.2%}\n\n")
-    
     print(f"Analysis complete. Results saved to {output_filename}")
 
 
 if __name__ == "__main__":
-    load_dotenv()
     print("Welcome to SluggerStats!")
     
     games = []
-    for year in range(2004, 2024):
+    for year in range(2002, 2025):
         file_path = f'data/retrosheet/seasons/{year}/GL{year}.TXT'
         try:
             games.extend(read_gamelog_to_dict(file_path))
         except FileNotFoundError:
             print(f"Warning: Gamelog for {year} not found at {file_path}")
             
-    print(f"Loaded {len(games)} games from 2004-2023.")
+    print(f"Loaded {len(games)} games from 2002-2024.")
     
-    featured_games = create_features(games)
+    featured_games, team_stats, pitcher_stats = create_features(games)
     
-    # Run the new test on the 2023 season
-    test_model_on_2023_season(featured_games)
+    # Train the model on historical data and evaluate it on the most recent season
+    xgb_model = train_and_evaluate_model(featured_games, test_year=2024)
 
-    lr_model = train_logistic_regression_model(featured_games)
-    xgb_model = train_xgboost_model(featured_games)
-
-    if lr_model and xgb_model:
-        api_key = os.getenv("THE_ODDS_API_KEY")
+    if xgb_model:
+        api_key = os.getenv("SPORTSBLAZE_API_KEY")
         if not api_key:
-            print("Error: API key not found. Please create a .env file and add your key.")
+            print("Error: SPORTSBLAZE_API_KEY not found in .env file.")
         else:
-            # Check if we have recent odds data
-            try:
-                with open('data/odds.json', 'r') as f:
-                    odds_data = json.load(f)
-                # If odds are older than 1 day, fetch new ones
-                file_time = datetime.fromtimestamp(os.path.getmtime('data/odds.json'), tz=timezone.utc)
-                if (datetime.now(timezone.utc) - file_time).days > 0:
-                    print("Odds data is old, fetching new data.")
-                    odds_data = get_live_odds(api_key)
-            except (FileNotFoundError, json.JSONDecodeError):
-                odds_data = get_live_odds(api_key)
-
-            if odds_data:
-                print("\n--- Generating predictions for Logistic Regression Model ---")
-                find_value_bets(lr_model, odds_data, featured_games, 'model_predictions.txt')
-                
-                print("\n--- Generating predictions for XGBoost Model ---")
-                find_value_bets(xgb_model, odds_data, featured_games, 'xgboost_results.txt') 
+            print("\n--- Generating predictions for XGBoost Model ---")
+            find_value_bets(xgb_model, api_key, team_stats, pitcher_stats, 'xgboost_results.txt')
