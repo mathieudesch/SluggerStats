@@ -1,6 +1,6 @@
-numpy
 scikit-learn
+xgboost
+pandas
 requests
 python-dotenv
-xgboost
-scikit-optimize 
+tzdata
